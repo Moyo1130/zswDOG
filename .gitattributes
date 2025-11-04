@@ -1,0 +1,10 @@
+# 统一所有 Python 文件为 LF
+*.py text eol=lf
+
+# 统一 IDE/VSCode 配置为 LF
+*.xml text eol=lf
+*.json text eol=lf
+
+# 二进制文件别动
+*.png binary
+*.jpg binary
