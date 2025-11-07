@@ -1,3 +1,5 @@
+* text=auto eol=lf
+
 # 统一所有 Python 文件为 LF
 *.py text eol=lf
 
