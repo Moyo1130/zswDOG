@@ -153,7 +153,7 @@ class SimpleKeyboardController:
         except Exception as e:
             print(f"❌ 切换失败: {e}\n")
     
-    def move_robot(self, direction, duration=2):
+    def move_robot(self, direction, duration=1):
         """移动机器人"""
         if not self.is_initialized:
             print("⚠️  请先初始化机器狗 (输入: init)")
