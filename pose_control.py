@@ -15,27 +15,33 @@
     quit        - 退出程序
 
 注意:
-    需要确保机器狗已连接且 ros_send.py 能正常获取位姿数据。
+    需要确保机器狗已连接且 ROS 环境已配置，能够接收 /leg_odom 话题。
 """
 
 import time
 import math
 import threading
 import sys
+import rospy
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from totalController import Controller
-from ros_send import get_robot_pose
 
 # 配置
-ROBOT_IP = "10.65.234.12"
+ROBOT_IP = "192.168.1.120"
 CMD_PORT = 43893    # 指令端口
-STATE_PORT = 43894  # 状态端口 (ROS topic)
 
 class PoseController:
-    def __init__(self, robot_ip, cmd_port, state_port):
+    def __init__(self, robot_ip, cmd_port):
         self.controller = Controller((robot_ip, cmd_port))
-        self.state_ip = robot_ip
-        self.state_port = state_port
         
+        # 初始化 ROS 节点和订阅者
+        # 检查节点是否已初始化，避免重复初始化
+        if rospy.get_node_uri() is None:
+            rospy.init_node('pose_controller', anonymous=True)
+        
+        rospy.Subscriber("/leg_odom", PoseWithCovarianceStamped, self.pose_callback)
+        self.latest_pose_data = None
+
         self.target_x = 0.0
         self.target_y = 0.0
         self.target_yaw = 0.0 # Optional: target heading
@@ -58,6 +64,27 @@ class PoseController:
         self.current_pose = None
         self.is_moving_to_target = False
 
+    def pose_callback(self, msg):
+        """ROS 回调函数，处理位姿数据"""
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        
+        x = position.x
+        y = position.y
+        
+        # 四元数转 Yaw 角
+        qx = orientation.x
+        qy = orientation.y
+        qz = orientation.z
+        qw = orientation.w
+        
+        # yaw (z-axis rotation)
+        siny_cosp = 2 * (qw * qz + qx * qy)
+        cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        
+        self.latest_pose_data = (x, y, yaw)
+
     def initialize(self):
         """初始化机器人"""
         print("正在初始化机器人...")
@@ -77,7 +104,7 @@ class PoseController:
 
     def get_pose(self):
         """获取当前位姿"""
-        return get_robot_pose(self.state_ip, self.state_port)
+        return self.latest_pose_data
 
     def set_target(self, x, y):
         """设置目标位置"""
@@ -230,7 +257,7 @@ def main():
     print("机器狗位姿闭环控制程序")
     print("="*50)
     
-    pose_controller = PoseController(ROBOT_IP, CMD_PORT, STATE_PORT)
+    pose_controller = PoseController(ROBOT_IP, CMD_PORT)
     pose_controller.start()
     
     print("输入 'help' 查看指令列表")
