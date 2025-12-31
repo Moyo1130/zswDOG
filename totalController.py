@@ -257,8 +257,8 @@ class Controller:
             time.sleep(1)
             
             # 2. 初始化关节
-            print("\n[2/4] 初始化关节...")
-            self.init_robot()
+            # print("\n[2/4] 初始化关节...")
+            # self.init_robot()
             
             # 3. 起立
             print("\n[3/4] 机器人起立...")
@@ -299,6 +299,16 @@ class Controller:
         """切换到原地模式"""
         print("切换到原地模式")
         self._send_command(CMD["MODE_STAY"])
+        
+    def switch_to_auto_mode(self):
+        """切换到自动控制模式"""
+        print("切换到自动控制模式")
+        self._send_command(CMD["MODE_AUTO"])
+        
+    def switch_to_manual_mode(self):
+        """切换到自动控制模式"""
+        print("切换到自动控制模式")
+        self._send_command(CMD["MODE_MANUAL"])
 
     def set_gait(self, gait_type):
         """

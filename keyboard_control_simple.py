@@ -37,6 +37,8 @@
     [模式切换]
     move    - 切换到移动模式
     stay    - 切换到原地模式
+    auto    - 切换到自动模式
+    manual  - 切换到手动模式
     
     help    - 显示帮助信息
 
@@ -50,7 +52,7 @@ import threading
 from totalController import Controller
 
 # 机器人配置
-ROBOT_IP = "192.168.1.120"  # 修改为你的机器人IP
+ROBOT_IP = "10.65.234.12"  # 修改为你的机器人IP
 ROBOT_PORT = 43893
 
 # 移动速度配置
@@ -70,6 +72,7 @@ class SimpleKeyboardController:
         self.is_standing = False
         self.is_moving = False
         self.current_gait = "low"
+        self.current_control_mode = "manual"  # 默认为手动模式
         self.running = True
     
     def print_help(self):
@@ -100,6 +103,8 @@ class SimpleKeyboardController:
         print("\n[模式切换]")
         print("  move   - 切换到移动模式")
         print("  stay   - 切换到原地模式")
+        print("  auto   - 切换到自动模式")
+        print("  manual - 切换到手动模式")
         print("\n[其他]")
         print("  help   - 显示此帮助信息")
         print("="*70)
@@ -148,7 +153,7 @@ class SimpleKeyboardController:
         except Exception as e:
             print(f"❌ 切换失败: {e}\n")
     
-    def move_robot(self, direction, duration=2):
+    def move_robot(self, direction, duration=1):
         """移动机器人"""
         if not self.is_initialized:
             print("⚠️  请先初始化机器狗 (输入: init)")
@@ -221,7 +226,7 @@ class SimpleKeyboardController:
             print(f"❌ 步态切换失败: {e}\n")
     
     def switch_mode(self, mode):
-        """切换模式"""
+        """切换运动模式"""
         if not self.is_initialized:
             print("⚠️  请先初始化机器狗 (输入: init)")
             return
@@ -236,6 +241,25 @@ class SimpleKeyboardController:
             time.sleep(0.1)
         except Exception as e:
             print(f"❌ 模式切换失败: {e}\n")
+    
+    def switch_control_mode(self, mode):
+        """切换控制模式（自动/手动）"""
+        if not self.is_initialized:
+            print("⚠️  请先初始化机器狗 (输入: init)")
+            return
+        
+        try:
+            if mode == "auto":
+                self.robot.switch_to_auto_mode()
+                self.current_control_mode = "auto"
+                print("✓ 已切换到自动模式\n")
+            elif mode == "manual":
+                self.robot.switch_to_manual_mode()
+                self.current_control_mode = "manual"
+                print("✓ 已切换到手动模式\n")
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"❌ 控制模式切换失败: {e}\n")
     
     def process_command(self, command):
         """处理命令"""
@@ -280,6 +304,10 @@ class SimpleKeyboardController:
             self.switch_mode('move')
         elif cmd == 'stay':
             self.switch_mode('stay')
+        elif cmd == 'auto':
+            self.switch_control_mode('auto')
+        elif cmd == 'manual':
+            self.switch_control_mode('manual')
         
         # 帮助
         elif cmd == 'help' or cmd == 'h':
