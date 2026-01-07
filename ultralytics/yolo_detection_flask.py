@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import cv2
 import time
 import threading
@@ -11,38 +11,36 @@ app = Flask(__name__)
 
 # === 配置参数 ===
 MODEL_NAME = "yolo11n.pt"
+# 请确保这是正确的 RTSP 地址
 RTSP_URL = "rtsp://admin:Zswbimvr@192.168.1.201:554/Streaming/Channels/101"
 DOG_CONTROL_URL = "http://127.0.0.1:5007"  # 机器狗控制服务地址
-PAUSE_DURATION = 10  # 检测到人后暂停检测的秒数
+PAUSE_DURATION = 20  # 【修改】冷却时间改为 20 秒
 
 # === 全局实例 ===
 detector = None
 detector_lock = threading.Lock()
 
+# === 全局视频帧缓存 (用于推流) ===
+global_frame = None
+frame_lock = threading.Lock()
 
-# ==========================================
-# 1. 人员检测管理器类
-# ==========================================
 class PersonDetector:
     def __init__(self, model_name, rtsp_url, dog_url, pause_duration):
         self.model_name = model_name
         self.rtsp_url = rtsp_url
         self.dog_control_url = dog_url
         self.pause_duration = pause_duration
-        
-        # 状态管理
+
         self.is_running = False
         self.detection_thread = None
         self.model = None
         self.cap = None
-        
-        # 统计信息
+
         self.last_detection_time = 0
         self.total_detections = 0
         self.start_time = 0
-        
+
     def initialize_model(self):
-        """初始化 YOLO 模型"""
         try:
             print(f"正在加载模型 {self.model_name}...")
             self.model = YOLO(self.model_name)
@@ -51,9 +49,8 @@ class PersonDetector:
         except Exception as e:
             print(f"❌ 模型加载失败: {e}")
             return False
-    
+
     def open_video_stream(self):
-        """打开视频流"""
         try:
             print(f"正在打开视频流 {self.rtsp_url}...")
             self.cap = cv2.VideoCapture(self.rtsp_url)
@@ -65,138 +62,100 @@ class PersonDetector:
         except Exception as e:
             print(f"❌ 视频流连接失败: {e}")
             return False
-    
-    def send_signal_to_dog(self, object_type):
-        """向机器狗服务发送控制信号
-        
-        Args:
-            object_type: 检测到的目标类型，如 "person", "car", "dog" 等
-        """
-        # 目标类型到动作和原因的映射表（可扩展）
-        object_action_map = {
-            "person": {
-                "action": "greet",
-                "reason": "person_detected",
-                "description": "检测到人员，发送打招呼信号"
-            },
-            # 未来可扩展其他目标类型
-            # "car": {
-            #     "action": "avoid",
-            #     "reason": "car_detected",
-            #     "description": "检测到车辆，发送避让信号"
-            # },
-        }
-        
-        # 获取对应的动作配置，如果不存在则使用默认停止动作
-        action_config = object_action_map.get(object_type, {
-            "action": "stop",
-            "reason": f"{object_type}_detected",
-            "description": f"检测到{object_type}，发送停止信号"
-        })
-        
+
+    def send_signal_to_dog(self):
+        """发送自动打招呼信号"""
         try:
+            # 【修改】发送特殊的 greet_auto 动作
             payload = {
-                "action": action_config["action"],
-                "reason": action_config["reason"],
-                "timestamp": time.time(),
-                "detected_object": object_type
+                "action": "greet_auto",
+                "reason": "person_detected",
+                "timestamp": time.time()
             }
             url = f"{self.dog_control_url}/dog/action"
-            print(f"🚨 {action_config['description']}...")
-            
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                print(f"✅ 机器狗响应成功: {response.json()}")
-                return True
-            else:
-                print(f"⚠️ 机器狗响应异常: {response.status_code}")
-                return False
-        except requests.exceptions.RequestException as e:
+            print(f"🚨 检测到人员，发送自动打招呼请求...")
+
+            # 使用极短的超时，避免阻塞检测线程
+            requests.post(url, json=payload, timeout=2)
+        except Exception as e:
             print(f"❌ 无法联系机器狗服务: {e}")
-            return False
-    
+
     def detect_person(self, results):
-        """检测结果中是否包含人物
-        
-        Args:
-            results: YOLO 模型的检测结果
-            
-        Returns:
-            bool: 如果检测到人返回 True，否则返回 False
-        """
         for result in results:
             for box in result.boxes:
-                if int(box.cls) == 0:  # class 0 是人 (COCO dataset)
+                if int(box.cls) == 0:  # class 0 is person
                     return True
         return False
-    
+
     def detection_loop(self):
-        """检测主循环"""
+        global global_frame
         print("🔍 检测循环已启动")
-        
+
         try:
             while self.is_running:
+                if self.cap is None or not self.cap.isOpened():
+                    time.sleep(1)
+                    continue
+
                 ret, frame = self.cap.read()
                 if not ret:
                     print("⚠️ 读取帧失败，尝试重连...")
+                    self.cap.release()
                     time.sleep(1)
-                    if not self.open_video_stream():
-                        break
+                    self.open_video_stream()
                     continue
-                
+
+                # 1. 执行检测
                 current_time = time.time()
-                time_since_last_detection = current_time - self.last_detection_time
-                
-                # 检查是否在冷却期
-                if time_since_last_detection > self.pause_duration:
-                    # 执行 YOLO 推理
-                    results = self.model(frame, verbose=False)
-                    
-                    # 调用人物检测函数判断是否有人
+                annotated_frame = frame # 默认显示原图
+
+                # 只有在非冷却期才进行推理，节省资源，或者一直推理但只在非冷却期触发动作
+                # 这里选择一直推理以便在前端画框
+                results = self.model(frame, verbose=False)
+                annotated_frame = results[0].plot() # 画框
+
+                # 2. 触发逻辑
+                time_since_last = current_time - self.last_detection_time
+
+                if time_since_last > self.pause_duration:
                     if self.detect_person(results):
-                        print(f"👤 检测到人员！暂停检测 {self.pause_duration} 秒")
+                        print(f"👤 检测到人员！触发交互 (冷却 {self.pause_duration}s)")
                         self.last_detection_time = current_time
                         self.total_detections += 1
-                        
-                        # 异步发送信号给机器狗，传入目标类型 "person"
-                        threading.Thread(
-                            target=self.send_signal_to_dog,
-                            args=("person",),
-                            daemon=True
-                        ).start()
-                
-                # 控制帧率，避免过度消耗CPU
-                time.sleep(0.03)  # 约30fps
-        
+
+                        # 异步发送信号
+                        threading.Thread(target=self.send_signal_to_dog, daemon=True).start()
+
+                # 3. 更新全局帧供推流使用
+                with frame_lock:
+                    global_frame = annotated_frame.copy()
+
+                # 控制帧率
+                time.sleep(0.03)
+
         except Exception as e:
             print(f"❌ 检测循环异常: {e}")
             traceback.print_exc()
         finally:
             if self.cap:
                 self.cap.release()
-                print("📹 视频流已释放")
-    
+
     def start_detection(self):
-        """启动检测"""
         if self.is_running:
             return {"success": False, "message": "检测已经在运行中"}
-        
-        # 初始化模型
+
         if not self.model:
             if not self.initialize_model():
                 return {"success": False, "message": "模型初始化失败"}
-        
-        # 打开视频流
+
         if not self.open_video_stream():
             return {"success": False, "message": "视频流连接失败"}
-        
-        # 启动检测线程
+
         self.is_running = True
         self.start_time = time.time()
-        self.total_detections = 0
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
-        
+
         return {"success": True, "message": "人员检测已启动"}
     
     def stop_detection(self):
@@ -258,9 +217,33 @@ def require_detector(f):
     return decorated_function
 
 
+def generate_frames():
+    global global_frame
+    while True:
+        with frame_lock:
+            if global_frame is None:
+                time.sleep(0.1)
+                continue
+
+            # 编码为 JPEG
+            ret, buffer = cv2.imencode('.jpg', global_frame)
+            frame_bytes = buffer.tobytes()
+
+        # 生成 MJPEG 流格式
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.04) # 限制推流帧率约 25fps
+
+
 # ==========================================
 # 3. Flask 路由接口
 # ==========================================
+
+@app.route('/video_feed')
+def video_feed():
+    """前端 <img> 标签的 src 地址"""
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 @app.route('/detection/start', methods=['POST'])
 @require_detector
 def start_detection(det):
@@ -322,7 +305,12 @@ def health_check():
         "status": "running"
     })
 
+@app.route('/detection/start', methods=['POST'])
+@require_detector
+def start_detection_route(det):
+    return jsonify(det.start_detection())
+
 
 if __name__ == "__main__":
-    print("🚀 启动人员检测服务 on port 5008...")
+    print(" 启动人员检测服务 on port 5008...")
     app.run(host='0.0.0.0', port=5008, threaded=True)

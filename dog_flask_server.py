@@ -55,11 +55,12 @@ class AutoPatrolController:
         self.waypoints_queue = deque()
         self.current_target = None
         self.is_patrolling = False
-        self.is_aligning = False
         self.running = True
+        self.is_paused = False  # 暂停标志位
 
-        # 卡点保护
+        # 卡点保护 / 状态计时器
         self.target_start_time = 0
+        self.close_proximity_start_time = None # [新增] 进入目标附近的时刻
 
         self.patrol_mode = "ONE_WAY"
         self.original_path = []
@@ -67,14 +68,11 @@ class AutoPatrolController:
 
         # === PID 参数 ===
         self.kp_linear = 0.6
-        self.kp_angular = 0.6
-        self.max_linear_speed = 1.0
-        self.max_angular_speed = 0.6
-
-        # 容差配置
-        self.dist_tolerance = 0.05
-        self.yaw_tolerance = 0.10
-        self.align_start_time = 0
+        self.kp_angular = 1.1          # 稍微加强一点转向力度
+        self.min_physical_speed = 0.15 # 稍微降低最小启动速度
+        self.max_linear_speed = 0.6
+        self.max_angular_speed = 0.8
+        self.arrival_threshold = 0.20  # [修改] 到达阈值放宽到 20cm
 
         if ROS_AVAILABLE:
             if rospy.get_node_uri() is None:
@@ -82,12 +80,52 @@ class AutoPatrolController:
             rospy.Subscriber("/leg_odom", PoseWithCovarianceStamped, self.pose_callback)
             threading.Thread(target=self.control_loop, daemon=True).start()
 
+    # 巡逻暂停
+    def pause(self):
+        if self.is_patrolling and not self.is_paused:
+            print("⏸️ 巡逻已暂停 (保持当前目标)")
+            self.is_paused = True
+            # 发送停止指令给底层
+            self.controller.move(0, 0, 0)
+            self.controller.stop_continuous_move()
+
+    # 巡逻恢复
+    def resume(self):
+        if self.is_patrolling and self.is_paused:
+            print("▶️ 巡逻已恢复")
+            self.is_paused = False
+            # 这里的 control_loop 会自动接管，不需要额外操作
+
+
     def reset_origin(self):
         if self.raw_pose != (0.0, 0.0, 0.0):
             self.origin_pose = self.raw_pose
-            print(f"坐标系已重置，新原点 (Raw): {self.origin_pose}")
+            self.latest_pose = (0.0, 0.0, 0.0) # 重置为原点
+            print(f"✅ 全局坐标系已建立/重置 (Raw Origin: {self.origin_pose})")
         else:
             print("⚠️ 警告: 尚未收到odom数据，无法重置原点")
+
+    def _calculate_local_offset(self, current_global, next_node_global):
+        cx, cy, cyaw = current_global
+        nx, ny, nyaw = next_node_global if len(next_node_global) == 3 else (
+        next_node_global[0], next_node_global[1], 0.0)
+
+        # 1. 计算全局坐标差
+        dx = nx - cx
+        dy = ny - cy
+
+        # 2. 旋转平移量 (全局delta -> 局部delta)
+        # 我们需要将向量 (dx, dy) 逆时针旋转 -cyaw 度
+        cos_val = math.cos(-cyaw)
+        sin_val = math.sin(-cyaw)
+
+        local_x = dx * cos_val - dy * sin_val
+        local_y = dx * sin_val + dy * cos_val
+
+        # 3. 计算角度差
+        local_yaw = normalize_angle(nyaw - cyaw)
+
+        return (local_x, local_y, local_yaw)
 
     def pose_callback(self, msg):
         pos = msg.pose.pose.position
@@ -96,6 +134,8 @@ class AutoPatrolController:
         cosy_cosp = 1 - 2 * (orient.y * orient.y + orient.z * orient.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         self.raw_pose = (pos.x, pos.y, yaw)
+
+        # 实时计算相对于原点的全局坐标
         if self.origin_pose:
             self.latest_pose = transform_to_local(self.raw_pose, self.origin_pose)
         else:
@@ -107,25 +147,28 @@ class AutoPatrolController:
             self.original_path = list(points)
             self.patrol_mode = mode
             self.current_path_points = points
-            self.is_aligning = False
 
-            if len(points) > 1:
-                closest_idx = self._find_closest_point_index(points)
-                if closest_idx == len(points) - 1 and self.patrol_mode == "LOOP":
-                    closest_idx = 0
-                start_points = points[closest_idx:]
-                for p in start_points:
-                    self._append_to_queue(p)
-            else:
-                for p in points:
-                    self._append_to_queue(p)
+            # === 修改 1: 仅在开始巡逻时重置一次原点 ===
+            print("🏁 初始化巡逻，重置坐标原点...")
+            self.reset_origin()
+            time.sleep(0.2) # 等待odom刷新
+
+            # 寻找最近点（如果没有指定从头开始）
+            # 注意：这里的最近点逻辑基于假设刚reset后我们在(0,0)附近
+            closest_idx = 0
+            # 如果需要智能寻找最近点，需要遍历points计算距离(0,0)最近的点
+            # 这里简化为从第0个点开始，或者你也可以保留原来的逻辑
+
+            start_points = points[closest_idx:]
+            for p in start_points:
+                self._append_to_queue(p)
 
             self.is_patrolling = True
-            print(f"🚀 巡逻开始 | 模式: {mode} | 起点索引: {0 if len(points) == 1 else '智能计算'}")
+            print(f"🚀 巡逻开始 | 模式: {mode} | 全局参考系模式")
 
     def _append_to_queue(self, p):
         if len(p) == 2:
-            self.waypoints_queue.append((p[0], p[1], None))
+            self.waypoints_queue.append((float(p[0]), float(p[1]), 0.0))
         else:
             self.waypoints_queue.append((float(p[0]), float(p[1]), float(p[2])))
 
@@ -144,8 +187,14 @@ class AutoPatrolController:
         self.is_patrolling = False
         self.waypoints_queue.clear()
         self.current_target = None
-        self.controller.start_continuous_move(0, 0, 0)
-        time.sleep(0.1)
+        if self.controller:
+            try:
+                self.controller.move(0, 0, 0)
+                self.controller.stop_continuous_move()
+                time.sleep(0.1)
+                self.controller.move(0, 0, 0)
+            except Exception as e:
+                print(f"停止指令异常: {e}")
 
     def _apply_deadzone(self, value, deadzone=0.2, max_val=1.0):
         if abs(value) < 0.05: return 0.0
@@ -185,195 +234,162 @@ class AutoPatrolController:
         return math.degrees(angle_diff)
 
     def control_loop(self):
-        rate = 10
+        rate = 20
         dt = 1.0 / rate
+
+        # 记录每段路径的最小剩余距离，防止错过点后一直跑
+        min_dist_record = float('inf')
+        last_log_time = 0
 
         while self.running:
             try:
-                if not self.is_patrolling or not ROS_AVAILABLE:
+                if self.is_paused:
+                    time.sleep(0.2)
+                    continue
+                # 状态检查
+                if not self.is_patrolling or not ROS_AVAILABLE or self.latest_pose is None:
                     time.sleep(0.2)
                     continue
 
-                # === 1. 获取新目标与【预转向逻辑】 ===
+                curr_x, curr_y, curr_yaw = self.latest_pose
+
+                # ----------------------------------------------------
+                # 阶段 1：获取新目标
+                # ----------------------------------------------------
                 if self.current_target is None:
-                    self.is_aligning = False
                     if len(self.waypoints_queue) > 0:
-                        self.current_target = self.waypoints_queue.popleft()
+                        next_global = self.waypoints_queue[0]
+                        self.current_target = next_global
                         self.target_start_time = time.time()
+                        self.close_proximity_start_time = None
+                        min_dist_record = float('inf')  # 重置最小距离记录
 
-                        print(f"📍 前往新目标: {self.current_target}")
-                        print(f"   当前位置: {self.latest_pose}")
+                        target_x, target_y, _ = next_global
+                        print(
+                            f"\n📍 [NEW GOAL] 前往新航点: ({target_x:.2f}, {target_y:.2f}) | 当前位置: ({curr_x:.2f}, {curr_y:.2f})")
 
-                        # ------------【新增核心逻辑：先转再走】------------
-                        # 计算需要转多少度才能面朝目标
-                        turn_deg = self._calculate_required_turn_degrees(self.latest_pose, self.current_target)
-                        print(f"📐 计算所需预转向角度: {turn_deg:.2f}°")
+                        # 初始大角度转向逻辑
+                        dx = target_x - curr_x
+                        dy = target_y - curr_y
+                        dist = math.sqrt(dx ** 2 + dy ** 2)
+                        desired_global_yaw = math.atan2(dy, dx)
+                        angle_diff = normalize_angle(desired_global_yaw - curr_yaw)
+                        turn_deg = math.degrees(angle_diff)
 
-                        # 硬性判定：如果角度差异超过 40 度，我们认为是“大弯”
-                        # 40度包含了你提到的 70度、80度、90度、135度的情况
-                        if abs(turn_deg) > 40:
-                            print(f"⚠️ 角度过大 ({turn_deg:.2f}°)，执行【原地停车转向】以防摆头...")
-
-                            # 1. 先完全停车
-                            self.controller.start_continuous_move(0, 0, 0)
-                            time.sleep(0.2)
-
-                            # 2. 调用精准转向 (这是一个阻塞操作，会一直等到转完)
-                            # 传入 turn_deg，正数左转，负数右转，符合 execute_precise_turn 逻辑
-                            success = execute_precise_turn(self.controller, self, turn_deg, timeout=6.0)
-
-                            if success:
-                                print(f"✅ 预转向完成，当前角度: {self.latest_pose[2]:.2f}，开始直线前往目标")
-                            else:
-                                print("❌ 预转向超时，尝试强制进入PID逻辑")
-
-                            # 更新一下开始时间，防止因为转向消耗时间导致误判超时
-                            self.target_start_time = time.time()
-
-                            # ----------------------------------------------------
-
-                    else:
-                        if self.patrol_mode == "LOOP":
-                            print("🔄 循环模式：本圈结束")
-
-                            # === 核心修复开始 ===
-                            # 1. 强制停车，消除运动惯性
-                            self.controller.start_continuous_move(0, 0, 0)
+                        if dist > 0.10 and abs(turn_deg) > 20.0:  # 加大角度阈值
+                            print(f"👉 执行初始转向修正: {turn_deg:.1f}°")
+                            execute_precise_turn(self.controller, self, turn_deg)
                             time.sleep(0.5)
-
-                            # 2. 重置原点！
-                            # 这会将机器狗当前的物理位置，强制设为新的 (0,0,0) 坐标系的中心
-                            # 这样，原本的第一点 [2, 0, 0] 就变成了“相对于当前位置向前2米”
-                            # 从而消除了上一圈积累的里程计误差。
-                            self.reset_origin()
-
-                            # 3. 重新装填路径
-                            print(f"📍 坐标系已重置，开始下一圈 (偏移已清零)")
+                            # 转向完重新获取位置
+                            continue
+                    else:
+                        # 队列处理
+                        if self.patrol_mode == "LOOP":
+                            print("🔄 循环模式：重新加载所有点")
                             for p in self.original_path:
                                 self._append_to_queue(p)
                             continue
                         else:
-                            print("✅ 巡逻结束")
+                            print("✅ 巡逻任务完成")
                             self.stop_patrol()
                             continue
 
-                if self.latest_pose is None:
-                    time.sleep(dt)
-                    continue
+                # ----------------------------------------------------
+                # 阶段 2：PID 控制与到达判定
+                # ----------------------------------------------------
+                tgt_x, tgt_y, _ = self.current_target
 
-                # 2. 超时跳过检测
-                if time.time() - self.target_start_time > 180.0:
-                    print(f"⚠️ 卡点超时(3min)，强制跳过当前点: {self.current_target}")
+                # 1. 计算全局误差
+                global_err_x = tgt_x - curr_x
+                global_err_y = tgt_y - curr_y
+                dist_remaining = math.sqrt(global_err_x ** 2 + global_err_y ** 2)
+
+                # 更新最小距离记录
+                if dist_remaining < min_dist_record:
+                    min_dist_record = dist_remaining
+
+                # ===== 日志打印 (每 1.5 秒打印一次) =====
+                if time.time() - last_log_time > 1.5:
+                    print(
+                        f"DEBUG: 坐标({curr_x:.2f},{curr_y:.2f})->目标({tgt_x:.2f},{tgt_y:.2f}) | 距离: {dist_remaining:.2f}m")
+                    last_log_time = time.time()
+
+                # ===== 判定逻辑 =====
+                is_arrived = False
+
+                # 判定 A: 距离达标
+                if dist_remaining < self.arrival_threshold:
+                    print(f"✅ 到达航点 (距离触发) | 剩余: {dist_remaining:.3f}m")
+                    is_arrived = True
+
+                # 判定 B: 近距离防震荡
+                if dist_remaining < 0.50:
+                    if self.close_proximity_start_time is None:
+                        self.close_proximity_start_time = time.time()
+                    elif time.time() - self.close_proximity_start_time > 3.0:
+                        print(f"⚠️ 接近目标超时 (防震荡触发) | 剩余: {dist_remaining:.3f}m")
+                        is_arrived = True
+                else:
+                    self.close_proximity_start_time = None
+
+                # 判定 C: 越过目标太远自动放弃 (比如错过了 1.5 米)
+                if dist_remaining > min_dist_record + 1.5 and min_dist_record < 5.0:
+                    print(f"⏭️ 似乎已越过目标并远离 ({dist_remaining:.2f}m > min {min_dist_record:.2f}m)，强制判定到达")
+                    is_arrived = True
+
+                # 判定 D: 总超时
+                if time.time() - self.target_start_time > 180.0:  # 60秒还没走到一个点
+                    print("⌛ 单点耗时过长，强制跳过")
+                    is_arrived = True
+
+                if is_arrived:
+                    self.controller.start_continuous_move(0, 0, 0)
+                    self.waypoints_queue.popleft()
                     self.current_target = None
+                    min_dist_record = float('inf')  # 重置
                     continue
+                # ===============================================
 
-                # 3. 计算全局误差
-                curr_x, curr_y, curr_yaw = self.latest_pose
-                tgt_x, tgt_y, tgt_yaw = self.current_target
+                # 2. 坐标转换 (Global -> Body)
+                cos_yaw = math.cos(curr_yaw)
+                sin_yaw = math.sin(curr_yaw)
 
-                err_x = tgt_x - curr_x
-                err_y = tgt_y - curr_y
-                dist = math.sqrt(err_x ** 2 + err_y ** 2)
+                body_err_x = cos_yaw * global_err_x + sin_yaw * global_err_y
+                body_err_y = -sin_yaw * global_err_x + cos_yaw * global_err_y
 
-                # 4. 判断对齐模式
-                if not self.is_aligning:
-                    if dist < self.dist_tolerance:
-                        self.is_aligning = True
-                        print(f"🎯 到达位置(误差{dist:.2f}m)，开始最后对齐...")
-                else:
-                    if time.time() - self.align_start_time > 6.0:
-                        print("⚠️ 对齐超时(5s)，强制跳至下一目标")
-                        self.current_target = None  # 跳过当前点，去下一个
-                        continue
-                    if dist > (self.dist_tolerance + 0.15):
-                        self.is_aligning = False
-                        print("⚠️ 偏离目标，重新移动...")
+                # 3. 计算 PID
+                angle_error_local = math.atan2(body_err_y, body_err_x)
 
-                # 5. 计算PID控制量
-                final_v_x = 0.0
-                final_v_y = 0.0
-                final_w_z = 0.0
+                # 距离越远，允许的速度越大；距离近了要减速
+                target_speed = self.kp_linear * body_err_x
 
-                if not self.is_aligning:
-                    # === 阶段A: 移动趋近 ===
-                    rel_x = err_x * math.cos(curr_yaw) + err_y * math.sin(curr_yaw)
-                    rel_y = (-err_x * math.sin(curr_yaw) + err_y * math.cos(curr_yaw))
+                # 角度偏差修正逻辑：如果偏得厉害，先别走那么快
+                if abs(angle_error_local) > 0.3:  # 大约17度
+                    target_speed *= 0.5
+                if abs(angle_error_local) > 0.8:  # 大约45度
+                    target_speed = 0.0  # 纯旋转
 
-                    target_heading_local = math.atan2(rel_y, rel_x)
+                # 限幅
+                v_cmd = max(min(target_speed, self.max_linear_speed), -self.max_linear_speed)
 
-                    # 这里的 AIM_THRESHOLD 可以设小一点，因为我们已经做过预对齐了
-                    # 此时主要是直线微调
-                    AIM_THRESHOLD = 0.20  # 约11度
+                # 最小速度保持
+                if abs(v_cmd) > 0.01 and abs(v_cmd) < self.min_physical_speed:
+                    v_cmd = math.copysign(self.min_physical_speed, v_cmd)
 
-                    if abs(target_heading_local) > AIM_THRESHOLD:
-                        # 依然保留这个分支作为保险，万一预对齐没对准
-                        v_cmd_x = 0.0
-                        v_cmd_y = 0.0
-                        raw_w = self.kp_angular * target_heading_local
+                # 禁止倒车 (可选，保持路径跟随稳定性)
+                if v_cmd < 0: v_cmd = 0
 
-                        if abs(raw_w) < 0.05: raw_w = 0
-                        w_cmd_z = self._apply_deadzone(raw_w, deadzone=0.2, max_val=0.5)
-                    else:
-                        # 直线前进，此时转弯分量应该很小
-                        w_cmd_z = self.kp_angular * target_heading_local
-                        v_cmd_x = self.kp_linear * rel_x
-                        v_cmd_y = 0.0  # 尽量不要用横移，容易打滑
+                w_cmd = self.kp_angular * angle_error_local
+                w_cmd = max(min(w_cmd, self.max_angular_speed), -self.max_angular_speed)
 
-                        v_cmd_x = self._apply_deadzone(v_cmd_x, deadzone=0.15, max_val=0.8)
-                        w_cmd_z = self._apply_deadzone(w_cmd_z, deadzone=0.15, max_val=0.4)
+                self.controller.start_continuous_move(v_cmd, 0, -w_cmd)
 
-                    v_cmd_x = max(min(v_cmd_x, 1.0), -1.0)
-                    w_cmd_z = max(min(w_cmd_z, 1.0), -1.0)
-
-                    final_v_x = self._apply_deadzone(v_cmd_x, deadzone=0.15, max_val=0.8)
-                    final_v_y = 0.0  # 强制关闭横移，防止斜跑
-                    final_w_z = self._apply_deadzone(w_cmd_z, deadzone=0.15, max_val=0.8)
-
-                    final_w_z = -final_w_z  # 方向修正
-
-                else:
-                    # === 阶段B: 到达后最终朝向对齐 ===
-                    if tgt_yaw is None:
-                        self.current_target = None
-                        continue
-
-                    yaw_err = tgt_yaw - curr_yaw
-                    while yaw_err > math.pi: yaw_err -= 2 * math.pi
-                    while yaw_err < -math.pi: yaw_err += 2 * math.pi
-
-                    if abs(yaw_err) < self.yaw_tolerance:
-                        print("✅ 精确对齐完成，前往下一目标")
-                        self.current_target = None
-                        continue
-
-                    # --- 修改开始：增强对齐时的扭矩 ---
-                    raw_w = self.kp_angular * yaw_err
-
-                    # 强制最小启动速度：如果误差存在，至少给 0.35 的速度
-                    min_align_speed = 0.35  # 如果地面摩擦大，改为 0.4
-
-                    if abs(raw_w) < min_align_speed:
-                        # 保持符号，但幅值强制提升到 min_align_speed
-                        raw_w = math.copysign(min_align_speed, raw_w)
-
-                    w_cmd_z = max(min(raw_w, 1.0), -1.0)  # 限幅 1.0
-
-                    # 这里 apply_deadzone 的 deadzone 参数其实失效了，因为上面已经保底了
-                    # 但为了安全 max_val 依然生效
-                    final_w_z = self._apply_deadzone(w_cmd_z, deadzone=0.1, max_val=0.8)
-                    final_w_z = -final_w_z
-
-                    final_v_x = 0.0
-                    final_v_y = 0.0
-
-                self.controller.start_continuous_move(final_v_x, final_v_y, final_w_z)
                 time.sleep(dt)
 
             except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"❌ 巡逻线程异常: {e}")
+                print(f"❌ 控制循环异常: {e}")
                 time.sleep(1.0)
+
 
     def return_safely(self):
         if not self.original_path:
@@ -396,121 +412,75 @@ class AutoPatrolController:
 class PathRecorder:
     def __init__(self, patrol_controller):
         self.patrol_ctrl = patrol_controller
-        self.recorded_path = []  # 存储元组 list [(x, y, yaw), ...]
-        self.min_dist_threshold = 0.2  # 最小记录间距，防止精度抖动导致重复点
+        self.recorded_path_global = []  # 存储用于显示的全局路径
+
+        # 累积器：记录从“上一次确认点”到“当前”总共走了多远（全局参考系下）
+        # 实际上，因为我们每次录制完都清零 Odom，所以 Odom 的读数就是“当前段的相对位移”
+        # 我们只需要维护一个 全局的求和 即可。
+        self.current_global_cursor = (0.0, 0.0, 0.0)
 
     def clear(self):
-        self.recorded_path = []
-        print("路径录制已清空")
-
+        self.recorded_path_global = []
+        self.current_global_cursor = (0.0, 0.0, 0.0)
+        # 清空物理坐标系
+        self.patrol_ctrl.reset_origin()
+        print("路径录制已清空，里程计已重置")
 
     def record_current_point(self):
-        """记录当前点位，带去重逻辑"""
-        curr_pose = self.patrol_ctrl.latest_pose  # (x, y, yaw)
-
-        # 简单校验数据有效性
-        if curr_pose == (0.0, 0.0, 0.0):
-            return {"success": False, "message": "未能获取有效定位数据(0,0,0)"}
-
-        # 去重逻辑：如果和上一个点距离太近，视为同一个点，更新即可或者是忽略
-        if len(self.recorded_path) > 0:
-            last_pose = self.recorded_path[-1]
-            dist = math.sqrt((curr_pose[0] - last_pose[0]) ** 2 + (curr_pose[1] - last_pose[1]) ** 2)
-            if dist < self.min_dist_threshold:
-                # 距离太近，更新最后一个点为当前更精确的点，或者直接忽略
-                self.recorded_path[-1] = curr_pose
-                return {"success": True, "message": f"点位更新(距离过近): {curr_pose}", "point": curr_pose,
-                        "count": len(self.recorded_path)}
-
-        self.recorded_path.append(curr_pose)
-        return {"success": True, "message": f"点位已记录: {curr_pose}", "point": curr_pose,
-                "count": len(self.recorded_path)}
-
-    def undo_last_point(self):
         """
-        单次原路返回：
-        1. 删掉当前所在的这个“错误”点（栈顶）
-        2. 导航回上一个点（新栈顶）
+        录制点位：
+        1. 读取当前的 Odom (这就是相对于上一个记录点的位移)
+        2. 将其叠加到全局游标上，形成全局坐标保存
+        3. 【重要】重置 Odom，为下一段录制做准备
         """
-        if len(self.recorded_path) == 0:
-            return {"success": False, "message": "没有可撤销的点位"}
+        # 1. 获取当前相对于上一次重置后的位移
+        local_x, local_y, local_yaw = self.patrol_ctrl.latest_pose
 
-        # 1. 删除当前点
-        removed = self.recorded_path.pop()
-        print(f"撤销点位: {removed}")
+        # 2. 计算这个位移对应的全局新坐标
+        # 上一个全局点
+        gx, gy, gyaw = self.current_global_cursor
 
-        if len(self.recorded_path) == 0:
-            # === 修改开始 ===
-            # 列表空了，说明刚才撤销的是唯一的起点。
-            # 为了符合直觉，我们让狗回到原点 (0,0,0) 并保持朝向为 0
-            print("所有点位已撤销，正在返回绝对原点 (0,0,0)...")
-            self.patrol_ctrl.start_patrol([(0.0, 0.0, 0.0)], mode="ONE_WAY")
-            return {"success": True, "message": "已撤销起点，正在返回初始原点", "remaining_count": 0}
-            # === 修改结束 ===
+        # 变换公式：将局部增量 (local_x, local_y) 旋转 gyaw 度，加到 (gx, gy) 上
+        cos_v = math.cos(gyaw)
+        sin_v = math.sin(gyaw)
 
-        # 2. 获取上一个点 (这是我们要回退去的目标)
-        target_pose = self.recorded_path[-1]
+        new_global_x = gx + (local_x * cos_v - local_y * sin_v)
+        new_global_y = gy + (local_x * sin_v + local_y * cos_v)
+        new_global_yaw = normalize_angle(gyaw + local_yaw)
 
-        # 3. 调用巡逻控制器去往该点
-        print(f"正在回退至上一个点: {target_pose}")
-        self.patrol_ctrl.start_patrol([target_pose], mode="ONE_WAY")
+        new_point_global = (new_global_x, new_global_y, new_global_yaw)
 
-        return {"success": True, "message": f"已撤销并正在返回上一点: {target_pose}",
-                "remaining_count": len(self.recorded_path)}
+        # 校验：如果是第一个点，可能就是 (0,0,0) 或者极其接近
+        if len(self.recorded_path_global) == 0:
+            # 强制第一个点是对齐的，或者直接记录
+            pass
 
-    def return_to_start(self):
-        """
-        最终原路返回：
-        将记录的路径反转，然后执行巡逻
-        """
-        if len(self.recorded_path) < 2:
-            return {"success": False, "message": "路径点过少，无需执行原路返回"}
+        # 3. 保存全局坐标（为了显示给用户看，和之后回放用）
+        self.recorded_path_global.append(new_point_global)
 
-        # 深度复制并反转
-        # 【需求2】原路返回时点位不变，朝向是否要反转？
-        # 用户需求：“朝向必须和最初的点位一致” -> 意味着我们要去那个点，并且拥有那个点的朝向。
-        # 所以直接传递 (x, y, yaw) 即可，不用反转 Yaw。
-        # 比如：我在 A 点是朝北的。去 B 点。原路返回回到 A 点，我希望狗最后是朝北停在 A 点。
-        # 那就把 A 点的 (x, y, yaw_north) 发给控制器即可。
+        # 更新游标
+        self.current_global_cursor = new_point_global
 
-        reverse_path = list(reversed(self.recorded_path))
+        # 4. 【核心】重置 Odom
+        # 这样用户从 A 走到 B，无论中间怎么乱走，只要停在 B 点点录制，
+        # 我们记录下 A->B 的向量后，立刻把 B 设为新的 0 点。
+        self.patrol_ctrl.reset_origin()
+        time.sleep(0.5)
 
-        print("开始原路返回，路径:", reverse_path)
-        # 调用时，这些点包含 yaw，AutoPatrolController 会自动执行“阶段B”对齐朝向
-        self.patrol_ctrl.start_patrol(reverse_path, mode="ONE_WAY")
+        print(f" 点位已记录(全局): {new_point_global}")
+        print(f"   (本段相对位移: {local_x:.2f}, {local_y:.2f}, {local_yaw:.2f})")
+        print("   >>> 里程计已重置，请继续前往下一个点")
 
-        return {"success": True, "message": "开始原路返回", "points": len(reverse_path)}
+        return {
+            "success": True,
+            "message": f"点位已记录。全局坐标: ({new_global_x:.2f}, {new_global_y:.2f})",
+            "point": new_point_global,
+            "count": len(self.recorded_path_global)
+        }
 
     def get_path_string(self):
-        """获取当前记录的所有点位，方便复制到知识库"""
-        # 格式化为 JSON 样式的字符串
-        path_str = "[" + ", ".join([f"({p[0]:.2f}, {p[1]:.2f})" for p in self.recorded_path]) + "]"
-        return path_str
-
-    # === 静默删除点位 ===
-    def delete_last_point_data_only(self):
-        """
-        【需求2实现】只删除数据，机器狗不动
-        """
-        if len(self.recorded_path) == 0:
-            return {"success": False, "message": "列表为空，无法删除"}
-
-        removed = self.recorded_path.pop()
-        print(f"已静默删除点位: {removed}")
-
-        return {"success": True, "message": "点位已删除，机器狗保持静止", "count": len(self.recorded_path)}
-
-    # === 停止录制（原地完成） ===
-    def stop_recording(self):
-        """
-        【需求1实现】结束录制，保存数据，不动
-        """
-        if len(self.recorded_path) == 0:
-            return {"success": False, "message": "没有录制数据"}
-
-        path_str = self.get_path_string()
-        print(f"录制完成，路径: {path_str}")
-        return {"success": True, "message": "录制已完成并停止", "full_path_str": path_str}
+        # 返回格式化字符串，直接用于复制到 Java/Prompt
+        return "[" + ", ".join([f"[{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}]" for p in self.recorded_path_global]) + "]"
 
 
 # ==========================================
@@ -578,80 +548,52 @@ def transform_to_local(raw_pose, origin_pose):
 
 
 # 闭环旋转函数
-def execute_precise_turn(controller, patrol_manager, target_angle_degrees, timeout=5.0):
-    """
-    闭环精准转向函数
-    :param controller: 运动控制器
-    :param patrol_manager: 拥有odom数据的管理器
-    :param target_angle_degrees: 目标相对角度（正数为左转/逆时针，负数为右转/顺时针）
-    :param timeout: 超时时间，防止死循环
-    """
+def execute_precise_turn(controller, patrol_manager, target_angle_degrees, timeout=8.0, post_delay=0.3):
     if not patrol_manager or not ROS_AVAILABLE:
-        print("⚠️ 无法获取 Odom 数据，无法执行精准转向")
+        print(" 无法获取 Odom 数据，无法执行精准转向")
         return False
 
-    # 1. 获取当前角度 (弧度)
-    # 注意：raw_pose 是 (x, y, yaw)
     _, _, start_yaw = patrol_manager.raw_pose
-
-    # 2. 计算目标角度 (弧度)
     radian_delta = math.radians(target_angle_degrees)
     target_yaw = normalize_angle(start_yaw + radian_delta)
 
-    print(f"🔄 开始精准转向: 目标增量 {target_angle_degrees}° | 起始Yaw {start_yaw:.2f} -> 目标Yaw {target_yaw:.2f}")
+    print(f"🔄 精准转向: {target_angle_degrees:.1f}° | TgtYaw: {math.degrees(target_yaw):.1f}°")
 
-    # P控制器参数
-    Kp = 2.0  # 比例系数，需要根据实际调整
-    max_speed = 1.0  # 最大转向速度
-    min_speed = 0.3  # 最小启动速度（克服静摩擦）
-    tolerance = 0.05  # 容差弧度 (约 2.8度)
+    Kp = 1.5
+    max_speed = 1.0
+    min_speed = 0.2
+    tolerance = 0.05 # ~3度
 
     start_time = time.time()
 
     try:
         while True:
-            # 超时保护
             if time.time() - start_time > timeout:
                 print("❌ 转向超时")
                 break
 
-            # 获取实时角度
             _, _, current_yaw = patrol_manager.raw_pose
+            error = normalize_angle(target_yaw - current_yaw) # 正值=目标在左边
 
-            # 计算误差 (最短路径)
-            error = normalize_angle(target_yaw - current_yaw)
-
-            # 到达目标
             if abs(error) < tolerance:
-                print(f"✅ 精准转向完成，最终误差: {math.degrees(error):.2f}°")
                 break
 
-            # 计算速度 (P控制)
+            # PID 计算 (正值代表需要向左转)
             turn_speed = Kp * error
-
-            # 限幅
             turn_speed = max(min(turn_speed, max_speed), -max_speed)
-
-            # 最小速度补偿（防止接近目标时因为速度太小转不动）
             if abs(turn_speed) < min_speed:
                 turn_speed = math.copysign(min_speed, turn_speed)
 
-            # 注意：totalController.py 中 turn_speed 正值通常代表向左转（逆时针）
-            # 如果发现方向反了，请将下面的 turn_speed 改为 -turn_speed
-            # 根据你之前的代码逻辑：Kp * error error为正表示需要逆时针转
-            # totalController 的 start_continuous_move(x, y, turn)
-            # 我们直接发送指令
+            # 【核心修复】数位取反发送给控制器
+            # 数学Positive(左) -> Controller Negative(左)
             controller.start_continuous_move(0, 0, -turn_speed)
+            time.sleep(0.05)
 
-            time.sleep(0.05)  # 20Hz 控制频率
-
+    except Exception as e:
+        print(f"转向异常: {e}")
     finally:
-        # 无论如何，最后停止
-        controller.stop_continuous_move()
-        # 更新状态，防止 patrol_manager 的状态混乱
-        # if patrol_manager:
-        #     patrol_manager.reset_origin()  # 可选：更新一下相对坐标系
-        pass
+        controller.start_continuous_move(0, 0, 0)
+        time.sleep(post_delay)
 
     return True
 
@@ -787,6 +729,39 @@ def dog_action(controller):
 
     data = request.json
     action = data.get('action', '').lower()
+
+    if action == "greet_auto":
+        print("🤖 收到自动打招呼请求...")
+
+        was_patrolling = False
+        if patrol_manager and patrol_manager.is_patrolling:
+            was_patrolling = True
+            print("   -> 正在巡逻，执行暂停...")
+            patrol_manager.pause()
+            time.sleep(0.5)  # 等待完全停稳
+
+        try:
+            # 执行打招呼流程 (共约 6-7 秒)
+            print("   -> 执行 GREET 动作")
+            controller.voice_command("GREET")
+            # GREET 动作本身需要时间，这里等待 6 秒
+            time.sleep(6)
+            controller.stop_voice_command()
+
+            # 恢复站立姿态，防止趴在地上
+            controller.stand_up(seconds=1)
+
+        except Exception as e:
+            print(f"   ❌ 动作执行出错: {e}")
+
+        # 恢复巡逻
+        if was_patrolling:
+            print("   -> 恢复巡逻...")
+            controller.switch_to_move_mode()  # 确保切回移动模式
+            time.sleep(0.5)
+            patrol_manager.resume()
+
+        return jsonify({"success": True, "message": "自动打招呼已完成"})
 
     if action == "stand_up":
         controller.stand_up()

@@ -663,7 +663,7 @@ class Controller:
         if self.move_running:
             # 如果已经在运行，更新参数
             self.move_params = (forward_speed, side_speed, turn_speed)
-            print(f"✓ 更新移动参数: 前进={forward_speed:.2f}, 侧移={side_speed:.2f}, 转向={turn_speed:.2f}")
+            # print(f"✓ 更新移动参数: 前进={forward_speed:.2f}, 侧移={side_speed:.2f}, 转向={turn_speed:.2f}")
         else:
             self.move_running = True
             self.move_params = (forward_speed, side_speed, turn_speed)
