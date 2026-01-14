@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, request, jsonify, Response
 import cv2
 import time
@@ -7,6 +9,7 @@ from ultralytics import YOLO
 from functools import wraps
 import traceback
 
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 app = Flask(__name__)
 
 # === 配置参数 ===
@@ -14,7 +17,7 @@ MODEL_NAME = "yolo11n.pt"
 # 请确保这是正确的 RTSP 地址
 RTSP_URL = "rtsp://admin:Zswbimvr@192.168.1.201:554/Streaming/Channels/101"
 DOG_CONTROL_URL = "http://127.0.0.1:5007"  # 机器狗控制服务地址
-PAUSE_DURATION = 20  # 【修改】冷却时间改为 20 秒
+PAUSE_DURATION = 61  # 冷却时间改为 20 秒
 
 # === 全局实例 ===
 detector = None
@@ -23,6 +26,48 @@ detector_lock = threading.Lock()
 # === 全局视频帧缓存 (用于推流) ===
 global_frame = None
 frame_lock = threading.Lock()
+
+
+class LatestFrameReader:
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        # --- 新增：设置缓冲区大小为1，减少积压 ---
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ret = False
+        self.running = True
+        self.t = threading.Thread(target=self._reader)
+        self.t.daemon = True
+        self.t.start()
+
+    def _reader(self):
+        while self.running:
+            if self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if not ret:
+                    time.sleep(0.01) # 稍微休眠避免死循环空转
+                    continue
+                with self.lock:
+                    self.ret = ret
+                    self.frame = frame # 总是覆盖为最新帧
+            else:
+                time.sleep(0.1)
+
+    def read(self):
+        with self.lock:
+            return self.ret, self.frame
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self.running = False
+        if self.t:
+            self.t.join(timeout=1)
+        self.cap.release()
+
 
 class PersonDetector:
     def __init__(self, model_name, rtsp_url, dog_url, pause_duration):
@@ -52,21 +97,26 @@ class PersonDetector:
 
     def open_video_stream(self):
         try:
-            print(f"正在打开视频流 {self.rtsp_url}...")
-            self.cap = cv2.VideoCapture(self.rtsp_url)
+            print(f"正在打开视频流 {self.rtsp_url} (TCP模式)...")
+            # 使用自定义的 LatestFrameReader 替代原生 VideoCapture
+            self.cap = LatestFrameReader(self.rtsp_url)
+
+            # 给一点时间让子线程读到第一帧
+            time.sleep(1.0)
+
             if not self.cap.isOpened():
                 print("❌ 无法打开视频流")
                 return False
-            print("✅ 视频流已连接")
+            print("✅ 视频流已连接 (低延迟模式)")
             return True
         except Exception as e:
             print(f"❌ 视频流连接失败: {e}")
             return False
 
+
     def send_signal_to_dog(self):
         """发送自动打招呼信号"""
         try:
-            # 【修改】发送特殊的 greet_auto 动作
             payload = {
                 "action": "greet_auto",
                 "reason": "person_detected",
@@ -75,8 +125,16 @@ class PersonDetector:
             url = f"{self.dog_control_url}/dog/action"
             print(f"🚨 检测到人员，发送自动打招呼请求...")
 
-            # 使用极短的超时，避免阻塞检测线程
-            requests.post(url, json=payload, timeout=2)
+            # 【修改】超时时间改为 0.5s，因为我们稍后会修改服务端让其立即返回
+            # 即使超时也不要在意，我们只负责通知
+            try:
+                requests.post(url, json=payload, timeout=0.5)
+            except requests.exceptions.ReadTimeout:
+                # 这是预期的，如果服务端处理慢，我们不等待
+                pass
+            except Exception as e:
+                print(f"⚠️ 发送请求异常(非致命): {e}")
+
         except Exception as e:
             print(f"❌ 无法联系机器狗服务: {e}")
 
@@ -91,47 +149,52 @@ class PersonDetector:
         global global_frame
         print("🔍 检测循环已启动")
 
+        # 帧计数器
+        frame_count = 0
+        # 检测间隔（每隔 3 帧检测一次，根据你的GPU性能调整，性能差就设大点）
+        detect_interval = 3
+
         try:
             while self.is_running:
                 if self.cap is None or not self.cap.isOpened():
                     time.sleep(1)
                     continue
 
+                # 1. 获取最新帧
                 ret, frame = self.cap.read()
-                if not ret:
-                    print("⚠️ 读取帧失败，尝试重连...")
-                    self.cap.release()
-                    time.sleep(1)
-                    self.open_video_stream()
+                if not ret or frame is None:
+                    time.sleep(0.01)
                     continue
 
-                # 1. 执行检测
-                current_time = time.time()
-                annotated_frame = frame # 默认显示原图
+                # 2. 决定是否进行检测
+                frame_count += 1
+                annotated_frame = frame # 默认就是原图
 
-                # 只有在非冷却期才进行推理，节省资源，或者一直推理但只在非冷却期触发动作
-                # 这里选择一直推理以便在前端画框
-                results = self.model(frame, verbose=False)
-                annotated_frame = results[0].plot() # 画框
+                # 只有在特定间隔才进行 YOLO 推理
+                if frame_count % detect_interval == 0:
+                    # 复制一份用于处理，避免影响原图
+                    process_frame = frame.copy()
 
-                # 2. 触发逻辑
-                time_since_last = current_time - self.last_detection_time
+                    # 执行检测
+                    results = self.model(process_frame, verbose=False)
+                    annotated_frame = results[0].plot() # 画框后的图
 
-                if time_since_last > self.pause_duration:
-                    if self.detect_person(results):
-                        print(f"👤 检测到人员！触发交互 (冷却 {self.pause_duration}s)")
-                        self.last_detection_time = current_time
-                        self.total_detections += 1
+                    # 触发打招呼逻辑
+                    current_time = time.time()
+                    if current_time - self.last_detection_time > self.pause_duration:
+                        if self.detect_person(results):
+                            print(f"👤 检测到人员！触发交互")
+                            self.last_detection_time = current_time
+                            self.total_detections += 1
+                            threading.Thread(target=self.send_signal_to_dog, daemon=True).start()
 
-                        # 异步发送信号
-                        threading.Thread(target=self.send_signal_to_dog, daemon=True).start()
-
-                # 3. 更新全局帧供推流使用
+                # 3. 更新全局帧 (这里非常关键：无论是否检测，都更新画面)
+                # 注意：如果跳帧检测，非检测帧将没有框。
+                # 如果希望一直有框，需要缓存上一次的 results 并重复画上去，这里为了低延迟先只显示最新画面
                 with frame_lock:
                     global_frame = annotated_frame.copy()
 
-                # 控制帧率
-                time.sleep(0.03)
+                time.sleep(0.005)
 
         except Exception as e:
             print(f"❌ 检测循环异常: {e}")
@@ -219,20 +282,38 @@ def require_detector(f):
 
 def generate_frames():
     global global_frame
+    # 记录上一帧的时间戳，用于控制最大帧率，而不是强制 sleep
+    last_time = 0
+    target_fps = 30
+    frame_interval = 1.0 / target_fps
+
     while True:
+        current_time = time.time()
+        # 如果距离上一帧时间太短，就跳过，避免发送太快浏览器处理不过来
+        if current_time - last_time < frame_interval:
+            time.sleep(0.001) # 极短休眠释放 CPU
+            continue
+
+        frame_to_encode = None
         with frame_lock:
             if global_frame is None:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
+            frame_to_encode = global_frame # 这里其实不需要 copy，因为 imencode 很快且 global_frame 会被整体替换
 
-            # 编码为 JPEG
-            ret, buffer = cv2.imencode('.jpg', global_frame)
-            frame_bytes = buffer.tobytes()
+        if frame_to_encode is not None:
+            try:
+                # 降低 JPEG 质量以减少数据量和编码时间 (质量 0-100，默认 95)
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+                ret, buffer = cv2.imencode('.jpg', frame_to_encode, encode_param)
 
-        # 生成 MJPEG 流格式
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        time.sleep(0.04) # 限制推流帧率约 25fps
+                if ret:
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                    last_time = time.time()
+            except Exception as e:
+                print(f"编码错误: {e}")
 
 
 # ==========================================
@@ -313,4 +394,14 @@ def start_detection_route(det):
 
 if __name__ == "__main__":
     print(" 启动人员检测服务 on port 5008...")
+
+    # 1. 手动初始化检测器
+    det = get_detector()
+
+    # 2. 自动启动检测线程 (这样一运行py文件，摄像头就开始工作)
+    print("正在自动启动检测线程...")
+    start_result = det.start_detection()
+    print(f"自动启动结果: {start_result}")
+
+    # 3. 启动 Flask
     app.run(host='0.0.0.0', port=5008, threaded=True)
