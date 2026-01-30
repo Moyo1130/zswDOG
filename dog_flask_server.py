@@ -28,6 +28,8 @@ robot = None  # 基础控制器实例
 patrol_manager = None  # 巡逻管理器实例
 recorder = None
 robot_lock = threading.Lock()
+is_greeting_lock = threading.Lock()
+is_performing_greet = False
 
 
 # 角度归一化
@@ -67,12 +69,12 @@ class AutoPatrolController:
         self.current_path_points = []
 
         # === PID 参数 ===
-        self.kp_linear = 0.6
+        self.kp_linear = 0.8
         self.kp_angular = 1.1          # 稍微加强一点转向力度
         self.min_physical_speed = 0.15 # 稍微降低最小启动速度
         self.max_linear_speed = 0.6
         self.max_angular_speed = 0.8
-        self.arrival_threshold = 0.20  # [修改] 到达阈值放宽到 20cm
+        self.arrival_threshold = 0.40  # [修改] 到达阈值放宽到 20cm
 
         if ROS_AVAILABLE:
             if rospy.get_node_uri() is None:
@@ -323,13 +325,14 @@ class AutoPatrolController:
                     is_arrived = True
 
                 # 判定 B: 近距离防震荡
-                if dist_remaining < 0.50:
+                if dist_remaining < 0.60:
                     if self.close_proximity_start_time is None:
                         self.close_proximity_start_time = time.time()
                     elif time.time() - self.close_proximity_start_time > 3.0:
                         print(f"⚠️ 接近目标超时 (防震荡触发) | 剩余: {dist_remaining:.3f}m")
                         is_arrived = True
-                else:
+                elif dist_remaining > 0.80:
+                    # 只有真的远离了才重置计时器
                     self.close_proximity_start_time = None
 
                 # 判定 C: 越过目标太远自动放弃 (比如错过了 1.5 米)
@@ -376,7 +379,7 @@ class AutoPatrolController:
                 if abs(v_cmd) > 0.01 and abs(v_cmd) < self.min_physical_speed:
                     v_cmd = math.copysign(self.min_physical_speed, v_cmd)
 
-                # 禁止倒车 (可选，保持路径跟随稳定性)
+                # 禁止倒车
                 if v_cmd < 0: v_cmd = 0
 
                 w_cmd = self.kp_angular * angle_error_local
@@ -723,45 +726,82 @@ def patrol_return_safely(controller):
 @app.route('/dog/action', methods=['POST'])
 @require_robot
 def dog_action(controller):
-    # 收到动作指令时，先停止巡逻
-    if patrol_manager:
-        patrol_manager.stop_patrol()
-
+    global is_performing_greet
     data = request.json
     action = data.get('action', '').lower()
 
     if action == "greet_auto":
+        # 检查是否正在打招呼
+        if is_performing_greet:
+            print("🤖 正在打招呼中，忽略重复请求")
+            return jsonify({"success": False, "message": "正在执行中，忽略"})
+
         print("🤖 收到自动打招呼请求...")
 
-        was_patrolling = False
-        if patrol_manager and patrol_manager.is_patrolling:
-            was_patrolling = True
-            print("   -> 正在巡逻，执行暂停...")
-            patrol_manager.pause()
-            time.sleep(0.5)  # 等待完全停稳
+        # 定义异步执行函数
+        def perform_greet_async():
+            global is_performing_greet
+            with is_greeting_lock:
+                is_performing_greet = True
 
-        try:
-            # 执行打招呼流程 (共约 6-7 秒)
-            print("   -> 执行 GREET 动作")
-            controller.voice_command("GREET")
-            # GREET 动作本身需要时间，这里等待 6 秒
-            time.sleep(6)
-            controller.stop_voice_command()
+            was_patrolling = False
+            try:
+                # 1. 如果正在巡逻，先暂停
+                if patrol_manager and patrol_manager.is_patrolling:
+                    was_patrolling = True
+                    print("   -> [1/6] 正在巡逻，执行暂停...")
+                    patrol_manager.pause()
+                    # 关键：给足时间让 PID 循环停止发送指令，防止指令冲突
+                    time.sleep(1.5)
 
-            # 恢复站立姿态，防止趴在地上
-            controller.stand_up(seconds=1)
+                # 2. 执行打招呼
+                print("   -> [2/6] 执行 GREET 动作")
+                controller.voice_command("GREET")
+                time.sleep(6)  # 等待动作完成
 
-        except Exception as e:
-            print(f"   ❌ 动作执行出错: {e}")
+                # 3. 停止语音指令状态 (防止机器狗卡在动作模式)
+                print("   -> [3/6] 停止动作指令")
+                controller.stop_voice_command()
+                time.sleep(0.5)
 
-        # 恢复巡逻
-        if was_patrolling:
-            print("   -> 恢复巡逻...")
-            controller.switch_to_move_mode()  # 确保切回移动模式
-            time.sleep(0.5)
-            patrol_manager.resume()
+                # 4. 恢复标准站立姿态
+                print("   -> [4/6] 恢复站立")
+                controller.stand_up(seconds=1)
+                time.sleep(1.0)
 
-        return jsonify({"success": True, "message": "自动打招呼已完成"})
+                # 5. 【核心修复】显式发送零速度指令，清除底层缓存
+                print("   -> [5/6] 清除速度缓存")
+                controller.move(0, 0, 0)
+                time.sleep(0.2)
+
+                # 6. 【核心修复】强制切换回移动模式
+                print("   -> [6/6] 切换回移动模式")
+                controller.switch_to_move_mode()
+                time.sleep(1.5)  # 给足时间让机器狗内部系统切换模式
+
+                # 7. 恢复巡逻
+                if was_patrolling:
+                    print("   -> ✅ 恢复巡逻...")
+                    patrol_manager.resume()
+
+            except Exception as e:
+                print(f"   ❌ 动作执行出错: {e}")
+                # 异常恢复机制：尝试切回移动模式，避免彻底死锁
+                try:
+                    controller.switch_to_move_mode()
+                    if was_patrolling:
+                        patrol_manager.resume()
+                except:
+                    pass
+            finally:
+                with is_greeting_lock:
+                    is_performing_greet = False
+                print("   -> 打招呼流程结束，标志位已重置")
+
+        # 启动线程执行
+        threading.Thread(target=perform_greet_async, daemon=True).start()
+
+        return jsonify({"success": True, "message": "自动打招呼指令已接收，正在后台执行"})
 
     if action == "stand_up":
         controller.stand_up()
