@@ -118,7 +118,8 @@ class Controller:
     3. 初始化关节 - 初始化机器人关节
     4. 让机器人起立 - 使用语音指令起立
     5. 切换到移动模式 - 切换到移动模式
-    6. 完成初始化 - 机器人准备就绪
+    6. 切换到自动模式 - 切换到自动模式
+    7. 完成初始化 - 机器人准备就绪
 
     属性:
         lock (bool): 是否锁定操作，防止重复触发动作
@@ -245,6 +246,7 @@ class Controller:
         2. 初始化关节
         3. 起立
         4. 切换到移动模式
+        5. 切换到自动模式
         """
         print("\n" + "="*50)
         print("🤖 开始初始化机器人")
@@ -269,7 +271,12 @@ class Controller:
             print("\n[4/4] 切换到移动模式...")
             self.switch_to_move_mode()
             time.sleep(1)
-            
+
+            # 5. 切换到自动模式
+            print("\n[5/4] 切换到自动模式...")
+            self.switch_to_auto_mode()
+            time.sleep(1)
+
             print("\n" + "="*50)
             print("✓ 机器人初始化完成，准备就绪！")
             print("="*50 + "\n")
@@ -303,12 +310,12 @@ class Controller:
     def switch_to_auto_mode(self):
         """切换到自动控制模式"""
         print("切换到自动控制模式")
-        self._send_command(CMD["MODE_AUTO"])
+        self._send_command(CMD["MODE_AUTO"], 0, -1)
         
     def switch_to_manual_mode(self):
-        """切换到自动控制模式"""
-        print("切换到自动控制模式")
-        self._send_command(CMD["MODE_MANUAL"])
+        """切换到手动控制模式"""
+        print("切换到手动控制模式")
+        self._send_command(CMD["MODE_MANUAL"], 0, -1)
 
     def set_gait(self, gait_type):
         """
