@@ -1,0 +1,68 @@
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.ipynb_checkpoints/
+
+# Coverage and test output
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging and build artifacts
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+*.local
+.python-version
+
+# Logs and runtime artifacts
+*.log
+*.pid
+*.pid.lock
+*.out
+*.err
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ROS / CMake / colcon build outputs
+build/
+install/
+devel/
+log/
+logs/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+Testing/
+compile_commands.json
